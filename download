@@ -1,0 +1,457 @@
+"""
+auction_com.py — Ingest Auction.com leads.
+
+COMPLIANCE NOTE:
+  Auction.com requires login / uses bot protection for most search pages.
+  This module DOES NOT scrape or bypass any authentication or bot protection.
+  
+  Instead it:
+    1. Reads a manually exported CSV from the `uploads/` folder (primary path).
+    2. Attempts to read the publicly visible, non-gated search results page as a
+       secondary source — but ONLY if robots.txt permits and no bot protection
+       is detected. If blocked, it logs clearly and exits gracefully.
+    3. Processes and normalises all fields into the standard AuctionRecord model.
+
+  To use: log in to Auction.com, apply your filters, click "Export" / "Download"
+  and save the CSV into the `uploads/` folder. The system will auto-detect it.
+"""
+from __future__ import annotations
+
+import csv
+import glob
+import os
+import re
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+from pydantic import BaseModel, validator
+
+from scraper.config import (
+    AUCTION_COM_SEARCH,
+    AUCTION_COM_BASE,
+    LOOKAHEAD_DAYS,
+    LOOKBACK_DAYS,
+    STATE,
+    COUNTIES,
+    UPLOAD_DIR,
+)
+from scraper.utils import (
+    can_fetch,
+    clean_address,
+    get_logger,
+    make_record_id,
+    make_session,
+    now_iso,
+    safe_float,
+    safe_get,
+    safe_str,
+)
+
+log = get_logger("auction_com")
+
+# ─── Data Model ────────────────────────────────────────────────────────────────
+
+class AuctionRecord(BaseModel):
+    auction_id: str = ""
+    property_url: str = ""
+    property_address: str = ""
+    property_city: str = ""
+    property_state: str = ""
+    property_zip: str = ""
+    county: str = ""
+    auction_date: str = ""
+    auction_time: str = ""
+    auction_type: str = ""
+    opening_bid: str = ""
+    estimated_resale_value: str = ""
+    property_type: str = ""
+    beds: str = ""
+    baths: str = ""
+    square_feet: str = ""
+    lot_size: str = ""
+    year_built: str = ""
+    occupancy_status: str = ""
+    foreclosure_status: str = ""
+    parcel_number: str = ""
+    case_number: str = ""
+    seller: str = ""
+    notes: str = ""
+    source: str = "Auction.com"
+    # Enrichment fields (populated later)
+    owner_name: str = ""
+    owner_first_name: str = ""
+    owner_last_name: str = ""
+    owner_is_entity: bool = False
+    mail_address: str = ""
+    mail_city: str = ""
+    mail_state: str = ""
+    mail_zip: str = ""
+    best_phone: str = ""
+    phone_type: str = ""
+    phone_confidence: int = 0
+    phone_source: str = ""
+    alt_phone_1: str = ""
+    alt_phone_2: str = ""
+    contact_confidence_notes: str = ""
+    flags: list = []
+    score: int = 0
+    record_id: str = ""
+    fetched_at: str = ""
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+# ─── CSV Column Mapping ────────────────────────────────────────────────────────
+# Maps possible Auction.com CSV column names → our standard field names.
+# Auction.com's export format may vary; we handle common aliases.
+
+COLUMN_MAP: dict[str, str] = {
+    # Address
+    "property address": "property_address",
+    "address": "property_address",
+    "street address": "property_address",
+    # City / State / Zip
+    "city": "property_city",
+    "state": "property_state",
+    "zip": "property_zip",
+    "zip code": "property_zip",
+    "postal code": "property_zip",
+    # County
+    "county": "county",
+    # Auction date / time
+    "auction date": "auction_date",
+    "sale date": "auction_date",
+    "event date": "auction_date",
+    "auction time": "auction_time",
+    "sale time": "auction_time",
+    # Auction type
+    "auction type": "auction_type",
+    "sale type": "auction_type",
+    "event type": "auction_type",
+    # Bids / value
+    "opening bid": "opening_bid",
+    "starting bid": "opening_bid",
+    "min bid": "opening_bid",
+    "estimated value": "estimated_resale_value",
+    "estimated resale value": "estimated_resale_value",
+    "arv": "estimated_resale_value",
+    # Property details
+    "property type": "property_type",
+    "type": "property_type",
+    "beds": "beds",
+    "bedrooms": "beds",
+    "baths": "baths",
+    "bathrooms": "baths",
+    "sq ft": "square_feet",
+    "square feet": "square_feet",
+    "sqft": "square_feet",
+    "lot size": "lot_size",
+    "year built": "year_built",
+    # Status
+    "occupancy": "occupancy_status",
+    "occupancy status": "occupancy_status",
+    "foreclosure status": "foreclosure_status",
+    "status": "foreclosure_status",
+    # IDs
+    "parcel": "parcel_number",
+    "parcel number": "parcel_number",
+    "pin": "parcel_number",
+    "apn": "parcel_number",
+    "case number": "case_number",
+    "case #": "case_number",
+    "auction id": "auction_id",
+    "id": "auction_id",
+    "asset id": "auction_id",
+    # URL
+    "url": "property_url",
+    "property url": "property_url",
+    "link": "property_url",
+    # Seller
+    "seller": "seller",
+    "bank": "seller",
+    "trustee": "seller",
+    "lender": "seller",
+    # Notes
+    "notes": "notes",
+    "comments": "notes",
+}
+
+
+def _normalize_header(col: str) -> str:
+    return col.strip().lower()
+
+
+def _map_row(row: dict) -> dict:
+    """Normalise a raw CSV row using COLUMN_MAP."""
+    out: dict = {}
+    for k, v in row.items():
+        norm = _normalize_header(k)
+        field = COLUMN_MAP.get(norm)
+        if field:
+            out[field] = safe_str(v)
+    return out
+
+
+def _parse_date(raw: str) -> str:
+    """Try to parse a date string into ISO YYYY-MM-DD."""
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%B %d, %Y", "%b %d, %Y",
+                "%m/%d/%y", "%Y%m%d"):
+        try:
+            return datetime.strptime(raw.strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return raw.strip()
+
+
+def _in_date_window(auction_date_str: str) -> bool:
+    """Return True if date is within lookback..lookahead window."""
+    try:
+        ad = date.fromisoformat(auction_date_str)
+        today = date.today()
+        return (today - timedelta(days=LOOKBACK_DAYS)) <= ad <= (today + timedelta(days=LOOKAHEAD_DAYS))
+    except Exception:
+        return True  # include if we can't parse
+
+
+def _normalise_auction_type(raw: str) -> str:
+    r = raw.strip().lower()
+    if "foreclos" in r:
+        return "foreclosure"
+    if "reo" in r or "bank" in r or "bank-owned" in r or "bank owned" in r:
+        return "bank_owned"
+    if "trustee" in r:
+        return "trustee_sale"
+    if "sheriff" in r:
+        return "sheriff_sale"
+    if "live" in r:
+        return "live_auction"
+    if "online" in r:
+        return "online_auction"
+    return raw.strip()
+
+
+# ─── CSV Ingestion ─────────────────────────────────────────────────────────────
+
+def load_from_upload_csv() -> list[AuctionRecord]:
+    """
+    Scan uploads/ directory for CSV files and load all auction records.
+    Returns a list of AuctionRecord objects.
+    """
+    records: list[AuctionRecord] = []
+    csv_files = glob.glob(os.path.join(UPLOAD_DIR, "*.csv"))
+    if not csv_files:
+        log.info(f"No CSV files found in {UPLOAD_DIR}/. Skipping upload ingestion.")
+        return records
+
+    for csv_path in csv_files:
+        log.info(f"Loading auction CSV: {csv_path}")
+        try:
+            with open(csv_path, newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for i, row in enumerate(reader):
+                    try:
+                        mapped = _map_row(row)
+                        if not mapped.get("property_address"):
+                            continue
+
+                        # Normalise / enrich fields
+                        mapped["property_address"] = clean_address(
+                            mapped.get("property_address", "")
+                        )
+                        if mapped.get("auction_date"):
+                            mapped["auction_date"] = _parse_date(mapped["auction_date"])
+                        if mapped.get("auction_type"):
+                            mapped["auction_type"] = _normalise_auction_type(
+                                mapped["auction_type"]
+                            )
+
+                        # Apply date window filter
+                        if mapped.get("auction_date") and not _in_date_window(
+                            mapped["auction_date"]
+                        ):
+                            log.debug(f"Skipping out-of-window: {mapped['auction_date']}")
+                            continue
+
+                        # County filter
+                        rec_county = mapped.get("county", "").strip().lower()
+                        if COUNTIES and not any(
+                            c.strip().lower() in rec_county for c in COUNTIES
+                        ):
+                            # Also check city if county not present
+                            rec_city = mapped.get("property_city", "").strip().lower()
+                            pass  # be lenient — county may be missing
+
+                        # State filter
+                        rec_state = mapped.get("property_state", "").strip().upper()
+                        if rec_state and rec_state != STATE.upper():
+                            continue
+
+                        mapped["fetched_at"] = now_iso()
+                        mapped["source"] = f"Auction.com CSV ({Path(csv_path).name})"
+                        mapped.setdefault("county", COUNTIES[0] if COUNTIES else "")
+
+                        # Build record ID
+                        mapped["record_id"] = make_record_id(
+                            mapped.get("property_address", ""),
+                            mapped.get("auction_date", ""),
+                        )
+
+                        rec = AuctionRecord(**{
+                            k: v for k, v in mapped.items()
+                            if k in AuctionRecord.__fields__
+                        })
+                        records.append(rec)
+
+                    except Exception as exc:
+                        log.error(f"Error parsing row {i} in {csv_path}: {exc}")
+                        continue
+        except Exception as exc:
+            log.error(f"Failed to open {csv_path}: {exc}")
+
+    log.info(f"Loaded {len(records)} records from upload CSVs.")
+    return records
+
+
+# ─── Public Page Attempt (non-gated, robots-checked) ──────────────────────────
+
+def _attempt_public_fetch() -> list[AuctionRecord]:
+    """
+    Attempt to read PUBLICLY VISIBLE (no login required) auction listing pages.
+    
+    This uses only publicly accessible data (no login, no CAPTCHA bypass).
+    If the site returns a login wall, CAPTCHA, or blocks us, we log and stop.
+    We check robots.txt first.
+    """
+    records: list[AuctionRecord] = []
+
+    if not can_fetch(AUCTION_COM_BASE, "/search"):
+        log.warning("robots.txt disallows /search on auction.com. Skipping public fetch.")
+        return records
+
+    session = make_session()
+
+    # Build a simple public search URL — Auction.com often shows some results
+    # before requiring login. We only collect what's publicly visible.
+    params = {
+        "keyword": f"{COUNTIES[0]} County, {STATE}" if COUNTIES else STATE,
+        "searchTypeId": "2",  # public search type
+    }
+
+    log.info("Attempting public Auction.com page fetch (no login / no bypass)...")
+    resp = safe_get(session, AUCTION_COM_SEARCH, params=params)
+
+    if resp is None:
+        log.warning("Auction.com public fetch returned no response. Skipping.")
+        return records
+
+    # Check for login wall / bot protection indicators
+    html = resp.text.lower()
+    block_signals = [
+        "sign in to view",
+        "log in to see",
+        "please sign in",
+        "access denied",
+        "captcha",
+        "are you a robot",
+        "cloudflare",
+        "just a moment",
+        "verify you are human",
+    ]
+    if any(sig in html for sig in block_signals):
+        log.warning(
+            "Auction.com appears to require login or bot protection is active. "
+            "Please manually export a CSV from Auction.com and place it in uploads/. "
+            "Skipping automated fetch."
+        )
+        return records
+
+    # If we get here, try to parse basic listing info from public HTML
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Auction.com uses React/JS rendering; static HTML may have limited data.
+        # We look for any <script type="application/ld+json"> structured data.
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                import json as _json
+                data = _json.loads(script.string or "")
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    items = data.get("itemListElement", [data])
+                else:
+                    continue
+
+                for item in items:
+                    try:
+                        addr = item.get("address", {})
+                        rec = AuctionRecord(
+                            property_address=clean_address(
+                                addr.get("streetAddress", "")
+                            ),
+                            property_city=addr.get("addressLocality", ""),
+                            property_state=addr.get("addressRegion", STATE),
+                            property_zip=addr.get("postalCode", ""),
+                            property_url=item.get("url", ""),
+                            property_type=item.get("@type", ""),
+                            source="Auction.com public page",
+                            fetched_at=now_iso(),
+                        )
+                        if rec.property_address:
+                            rec.record_id = make_record_id(
+                                rec.property_address, rec.auction_date
+                            )
+                            records.append(rec)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    except ImportError:
+        log.error("BeautifulSoup not installed. pip install beautifulsoup4")
+
+    log.info(f"Public page fetch returned {len(records)} records.")
+    return records
+
+
+# ─── Deduplication ─────────────────────────────────────────────────────────────
+
+def deduplicate(records: list[AuctionRecord]) -> list[AuctionRecord]:
+    seen: set[str] = set()
+    unique: list[AuctionRecord] = []
+    for r in records:
+        key = r.record_id or make_record_id(r.property_address, r.auction_date)
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+        else:
+            log.debug(f"Duplicate dropped: {key}")
+    log.info(f"Deduplication: {len(records)} → {len(unique)} records")
+    return unique
+
+
+# ─── Main Entry ────────────────────────────────────────────────────────────────
+
+def collect_auction_records() -> list[AuctionRecord]:
+    """
+    Primary entry point. Returns deduplicated list of AuctionRecord objects.
+    Sources (in priority order):
+      1. Manually uploaded CSVs from uploads/ directory (preferred, most complete).
+      2. Publicly accessible pages on Auction.com (fallback, robots-checked).
+    """
+    records: list[AuctionRecord] = []
+
+    # Source 1: uploaded CSVs
+    csv_records = load_from_upload_csv()
+    records.extend(csv_records)
+
+    # Source 2: public page fallback (only if no uploaded CSVs)
+    if not csv_records:
+        log.info("No upload CSVs found. Attempting public page fetch as fallback.")
+        public_records = _attempt_public_fetch()
+        records.extend(public_records)
+
+    return deduplicate(records)

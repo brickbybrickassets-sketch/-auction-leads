@@ -1,0 +1,9 @@
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+playwright==1.43.0
+pandas==2.2.1
+rapidfuzz==3.6.1
+pydantic==2.6.4
+python-dotenv==1.0.1
+tenacity==8.2.3

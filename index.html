@@ -1,0 +1,202 @@
+# 🏚 Auction Lead Collection System
+
+Automated daily pipeline for collecting, enriching, scoring, and exporting real estate auction leads from Auction.com — built for real estate investors targeting Cook County, IL (configurable for any state/county).
+
+---
+
+## ⚡ Quick Start
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/YOUR_USERNAME/auction-leads.git
+cd auction-leads
+
+# 2. Install dependencies
+pip install -r scraper/requirements.txt
+python -m playwright install --with-deps chromium
+
+# 3. Add your Auction.com export CSV
+#    Log into Auction.com → apply your filters → Export CSV → save to uploads/
+cp ~/Downloads/auction_export.csv uploads/
+
+# 4. Run the pipeline
+python scraper/fetch.py
+
+# 5. View exports
+open exports/auction_leads.csv
+open exports/ghl_auction_export.csv
+open dashboard/index.html
+```
+
+---
+
+## 📁 File Structure
+
+```
+auction-leads/
+├── scraper/
+│   ├── fetch.py          # Main orchestrator — run this
+│   ├── auction_com.py    # Auction.com CSV ingestion + public page fallback
+│   ├── enrich_owner.py   # Owner lookup: Cook County Assessor/Recorder APIs
+│   ├── skiptrace_free.py # Free phone lookup: TruePeopleSearch, FastPeopleSearch
+│   ├── scoring.py        # Lead scoring (0–100) + flag assignment
+│   ├── export.py         # JSON, CSV, GHL, skiptrace exports
+│   ├── utils.py          # Shared helpers, rate limiting, robots.txt
+│   ├── config.py         # All configuration (env-overridable)
+│   └── requirements.txt
+├── uploads/              # ← Place your Auction.com CSV exports here
+├── data/
+│   └── records.json      # Full enriched records
+├── dashboard/
+│   ├── index.html        # Interactive dashboard (deployed to GitHub Pages)
+│   └── records.json      # Dashboard data copy
+├── exports/
+│   ├── auction_leads.csv     # Full lead export
+│   ├── ghl_auction_export.csv # GoHighLevel CRM import
+│   └── skiptrace_review.csv  # Records needing manual phone lookup
+├── logs/
+│   └── run_log.json      # Run history (last 30 runs)
+├── .github/
+│   └── workflows/
+│       └── scrape.yml    # Daily GitHub Actions job (7am UTC)
+└── README.md
+```
+
+---
+
+## 🔧 Configuration
+
+All settings can be overridden with environment variables or a `.env` file:
+
+| Variable | Default | Description |
+|---|---|---|
+| `TARGET_STATE` | `IL` | State filter (2-letter code) |
+| `TARGET_COUNTIES` | `Cook` | Comma-separated county names |
+| `LOOKAHEAD_DAYS` | `30` | How far ahead to look for auctions |
+| `LOOKBACK_DAYS` | `7` | Days back to catch newly listed |
+| `MIN_DELAY` | `2.5` | Min seconds between requests |
+| `MAX_DELAY` | `7.0` | Max seconds between requests |
+| `MAX_RETRIES` | `3` | Retry attempts per request |
+| `HEADLESS` | `true` | Run browser headless |
+
+Example `.env`:
+```env
+TARGET_STATE=IL
+TARGET_COUNTIES=Cook,DuPage,Lake
+LOOKAHEAD_DAYS=30
+```
+
+---
+
+## 🏛️ Data Sources
+
+### Primary: Auction.com CSV Upload (Recommended)
+1. Log in to [auction.com](https://www.auction.com)
+2. Search → Filter by state/county/type
+3. Click **Export** or **Download CSV**
+4. Place the file in `uploads/`
+5. Run `python scraper/fetch.py`
+
+### Owner Enrichment (Public APIs — No Login Required)
+- **Cook County Assessor** open data API (taxpayer/owner name, mailing address)
+- **Cook County Recorder** open data API (deed/transfer grantee)
+- **Bing search snippets** (last resort, reads only publicly visible text)
+
+### Phone Lookup (Free Public Sites — Visible Content Only)
+- TruePeopleSearch
+- FastPeopleSearch
+- SearchPeopleFree
+
+> **Compliance**: Only data visible without login or payment is collected. robots.txt is checked before every domain. Rate limiting is enforced. No CAPTCHA bypass. No spam automation.
+
+---
+
+## 📊 Lead Scoring (0–100)
+
+| Condition | Points |
+|---|---|
+| Base score | +30 |
+| Auction ≤ 7 days | +20 |
+| Auction ≤ 14 days | +15 |
+| Auction ≤ 30 days | +10 |
+| Opening bid ≤ 60% of ARV | +15 |
+| Occupied property | +15 |
+| Vacant property | +10 |
+| Foreclosure auction | +10 |
+| REO/bank-owned | +10 |
+| LLC/corp owner | +10 |
+| Absentee owner (zip mismatch) | +10 |
+| Phone confidence > 70 | +10 |
+| Newly added this week | +5 |
+| No owner found | -15 |
+| No phone found | -20 |
+| Low confidence phone | -10 |
+
+---
+
+## 🤖 GitHub Actions (Daily Automation)
+
+The workflow runs at **7:00 AM UTC** daily and on manual trigger.
+
+### Setup:
+1. Push the repo to GitHub
+2. Go to **Settings → Pages** → Source: `gh-pages` branch
+3. Go to **Settings → Actions → General** → Allow write permissions
+4. (Optional) Set repository variables: `TARGET_STATE`, `TARGET_COUNTIES`, etc.
+
+The action will:
+- Install Python dependencies + Playwright
+- Run `python scraper/fetch.py`
+- Commit updated `records.json` and CSV exports
+- Deploy `dashboard/` to GitHub Pages
+
+---
+
+## 💾 Output Files
+
+| File | Description |
+|---|---|
+| `exports/auction_leads.csv` | Full enriched lead list — all fields |
+| `exports/ghl_auction_export.csv` | GoHighLevel CRM import format |
+| `exports/skiptrace_review.csv` | Records with no/low-confidence phone (for manual lookup) |
+| `data/records.json` | Full JSON with metadata |
+| `dashboard/records.json` | Dashboard data |
+| `logs/run_log.json` | Last 30 run summaries |
+
+---
+
+## 🖥️ Dashboard
+
+Open `dashboard/index.html` in a browser (or visit your GitHub Pages URL).
+
+Features:
+- Total leads / with phone / high confidence / avg score stats
+- Hot auction countdown (≤7 days highlighted in red)
+- Filter by county, auction type, score, flag, phone status
+- Sortable table
+- Detail modal per property
+- Download CSV buttons
+
+---
+
+## 📋 CLI Options
+
+```bash
+python scraper/fetch.py                  # Full run
+python scraper/fetch.py --dry-run        # Score only, skip enrichment
+python scraper/fetch.py --no-phone       # Skip phone lookup
+python scraper/fetch.py --resume         # Resume from saved records
+python scraper/fetch.py --limit 10       # Process only 10 records (testing)
+```
+
+---
+
+## ⚖️ Compliance Notes
+
+- This tool **does not** bypass CAPTCHA, login walls, paywalls, or bot protection.
+- It **does not** scrape Auction.com if the site blocks access — it uses manually exported CSVs instead.
+- People-search enrichment only reads **publicly visible** content (no login, no payment).
+- `robots.txt` is checked before fetching any domain.
+- Rate limiting (2.5–7s random delays) is enforced on all requests.
+- Output is intended for **lawful real estate outreach** only.
+- Users are responsible for compliance with the CAN-SPAM Act, TCPA, and applicable state laws.

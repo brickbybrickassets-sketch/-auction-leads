@@ -1,0 +1,163 @@
+"""
+scoring.py — Lead scoring (0–100) and flag assignment.
+
+Scoring logic as specified. Flags are string labels attached to each record.
+"""
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+from scraper.utils import get_logger, safe_float, safe_str
+
+log = get_logger("scoring")
+
+# ─── Flag Labels ───────────────────────────────────────────────────────────────
+
+FLAG_AUCTION = "Auction Property"
+FLAG_FORECLOSURE = "Foreclosure"
+FLAG_REO = "REO / Bank-Owned"
+FLAG_OCCUPIED = "Occupied"
+FLAG_VACANT = "Vacant"
+FLAG_ABSENTEE = "Absentee Owner"
+FLAG_LLC = "LLC / Corp Owner"
+FLAG_NEW_THIS_WEEK = "New This Week"
+FLAG_HOT_DATE = "Hot Auction Date"
+FLAG_PHONE_FOUND = "Phone Found"
+FLAG_HIGH_CONFIDENCE = "High Confidence Contact"
+FLAG_MANUAL_REVIEW = "Needs Manual Review"
+
+
+def _days_until(auction_date_str: str) -> int | None:
+    try:
+        ad = date.fromisoformat(auction_date_str.strip())
+        delta = (ad - date.today()).days
+        return delta
+    except Exception:
+        return None
+
+
+def score_record(record: dict) -> tuple[int, list[str]]:
+    """
+    Score a single record dict.
+    Returns (score: int, flags: list[str]).
+    """
+    score = 30  # base
+    flags: list[str] = [FLAG_AUCTION]
+
+    auction_date_str = safe_str(record.get("auction_date"))
+    auction_type = safe_str(record.get("auction_type")).lower()
+    occupancy = safe_str(record.get("occupancy_status")).lower()
+    foreclosure_status = safe_str(record.get("foreclosure_status")).lower()
+    opening_bid = safe_float(record.get("opening_bid", 0))
+    arv = safe_float(record.get("estimated_resale_value", 0))
+    owner_name = safe_str(record.get("owner_name"))
+    owner_is_entity = record.get("owner_is_entity", False)
+    best_phone = safe_str(record.get("best_phone"))
+    phone_confidence = int(record.get("phone_confidence", 0))
+    mail_zip = safe_str(record.get("mail_zip"))
+    prop_zip = safe_str(record.get("property_zip"))
+    fetched_at = safe_str(record.get("fetched_at"))
+    property_address = safe_str(record.get("property_address"))
+
+    # ── Auction Date Scoring ─────────────────────────────────────────────────
+    days_until = _days_until(auction_date_str)
+    if days_until is not None:
+        if 0 <= days_until <= 7:
+            score += 20
+            flags.append(FLAG_HOT_DATE)
+        elif 8 <= days_until <= 14:
+            score += 15
+            flags.append(FLAG_HOT_DATE)
+        elif 15 <= days_until <= 30:
+            score += 10
+
+    # ── Opening Bid vs ARV ────────────────────────────────────────────────────
+    if opening_bid > 0 and arv > 0:
+        ratio = opening_bid / arv
+        if ratio <= 0.60:  # bid is 60% or less of ARV = big discount
+            score += 15
+
+    # ── Occupancy ─────────────────────────────────────────────────────────────
+    if "occupied" in occupancy:
+        score += 15
+        flags.append(FLAG_OCCUPIED)
+    elif "vacant" in occupancy:
+        score += 10
+        flags.append(FLAG_VACANT)
+
+    # ── Auction Type ─────────────────────────────────────────────────────────
+    if "foreclos" in auction_type:
+        score += 10
+        flags.append(FLAG_FORECLOSURE)
+    if "reo" in auction_type or "bank" in auction_type:
+        score += 10
+        flags.append(FLAG_REO)
+    if "sheriff" in auction_type:
+        flags.append(FLAG_FORECLOSURE)
+
+    # ── Owner Type ────────────────────────────────────────────────────────────
+    if owner_is_entity:
+        score += 10
+        flags.append(FLAG_LLC)
+
+    # ── Absentee Owner ────────────────────────────────────────────────────────
+    if mail_zip and prop_zip and mail_zip[:5] != prop_zip[:5]:
+        score += 10
+        flags.append(FLAG_ABSENTEE)
+
+    # ── Phone Confidence ─────────────────────────────────────────────────────
+    if best_phone:
+        flags.append(FLAG_PHONE_FOUND)
+        if phone_confidence > 70:
+            score += 10
+            flags.append(FLAG_HIGH_CONFIDENCE)
+
+    # ── Newly Added This Week ─────────────────────────────────────────────────
+    try:
+        if fetched_at:
+            from datetime import datetime
+            fetched = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            if (datetime.utcnow().replace(tzinfo=fetched.tzinfo) - fetched).days <= 7:
+                score += 5
+                flags.append(FLAG_NEW_THIS_WEEK)
+    except Exception:
+        pass
+
+    # ── Deductions ────────────────────────────────────────────────────────────
+    if not owner_name:
+        score -= 15
+        flags.append(FLAG_MANUAL_REVIEW)
+
+    if not best_phone:
+        score -= 20
+        flags.append(FLAG_MANUAL_REVIEW)
+    elif phone_confidence < 30:
+        score -= 10
+
+    if not property_address:
+        score -= 10
+        flags.append(FLAG_MANUAL_REVIEW)
+
+    # Remove duplicate flags
+    seen: set = set()
+    deduped_flags: list[str] = []
+    for f in flags:
+        if f not in seen:
+            seen.add(f)
+            deduped_flags.append(f)
+
+    return max(0, min(100, score)), deduped_flags
+
+
+def score_all(records: list[dict]) -> list[dict]:
+    """Apply scoring to every record in a list. Mutates in place, returns list."""
+    for r in records:
+        try:
+            score, flags = score_record(r)
+            r["score"] = score
+            r["flags"] = flags
+        except Exception as exc:
+            log.error(f"Scoring error for record {r.get('record_id', '?')}: {exc}")
+            r["score"] = 0
+            r["flags"] = [FLAG_MANUAL_REVIEW]
+    return records

@@ -1,0 +1,67 @@
+name: Daily Auction Lead Collection
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  collect-leads:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('scraper/requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r scraper/requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Ensure output directories exist
+        run: |
+          mkdir -p data dashboard exports logs uploads
+
+      - name: Run auction lead collector
+        run: python scraper/fetch.py
+        env:
+          TARGET_STATE: ${{ vars.TARGET_STATE || 'IL' }}
+          TARGET_COUNTIES: ${{ vars.TARGET_COUNTIES || 'Cook' }}
+          LOOKAHEAD_DAYS: ${{ vars.LOOKAHEAD_DAYS || '30' }}
+          LOOKBACK_DAYS: ${{ vars.LOOKBACK_DAYS || '7' }}
+          HEADLESS: "true"
+
+      - name: Commit updated exports
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/records.json dashboard/records.json \
+                  exports/auction_leads.csv exports/ghl_auction_export.csv \
+                  exports/skiptrace_review.csv logs/run_log.json || true
+          git diff --cached --quiet || git commit -m "chore: daily auction leads update $(date -u +'%Y-%m-%d')"
+          git push
+
+      - name: Deploy dashboard to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dashboard
+          keep_files: true
