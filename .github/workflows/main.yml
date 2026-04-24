@@ -1,0 +1,62 @@
+name: Daily Auction Lead Collection
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  collect-leads:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r scraper/requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Ensure output directories exist
+        run: mkdir -p data dashboard exports logs uploads scraper
+
+      - name: Move files into correct folders
+        run: |
+          mkdir -p scraper dashboard
+          for f in auction_com.py config.py enrich_owner.py export.py fetch.py scoring.py skiptrace_free.py utils.py requirements.txt __init__.py; do
+            [ -f "$f" ] && mv "$f" scraper/ || true
+          done
+          [ -f index.html ] && mv index.html dashboard/ || true
+          [ -f records.json ] && cp records.json dashboard/ && mv records.json data/ || true
+          [ -f auction_leads.csv ] && mv auction_leads.csv exports/ || true
+
+      - name: Run auction lead collector
+        run: python scraper/fetch.py
+
+      - name: Commit updated exports
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "chore: daily auction leads $(date -u +'%Y-%m-%d')"
+          git push
+
+      - name: Deploy dashboard to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dashboard
+          keep_files: true
